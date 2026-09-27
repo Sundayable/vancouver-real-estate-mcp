@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 import sys
 import zipfile
+from html import unescape
+from urllib.parse import unquote, urljoin, urlsplit
 
 import openpyxl
 
@@ -50,6 +52,44 @@ WORKBOOKS = {
 }
 
 
+# CREA has renamed the archive before: 'MLS_HPI-July-2026_EN.zip' through
+# mid-2026, then 'MLS_HPI_Sept_2026.zip'. Take any linked zip whose file name
+# says MLS HPI, absolute or relative, rather than one spelling of the name.
+HREF = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+ZIP_NAME = re.compile(r"MLS[\s_-]*HPI[^/]*\.zip$", re.IGNORECASE)
+FRENCH = re.compile(r"[_-]FR(?:[_.-]|$)|french|francais", re.IGNORECASE)
+MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1
+    )
+}
+
+
+def zip_month(url: str) -> tuple[int, int]:
+    """'.../MLS_HPI_Sept_2026.zip' -> (2026, 9); (0, 0) if the name has no date."""
+    name = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+    year = re.search(r"(20\d{2})", name)
+    month = re.search(r"(?<![a-z])(" + "|".join(MONTHS) + r")[a-z]*", name, re.IGNORECASE)
+    if not year or not month:
+        return (0, 0)
+    return (int(year.group(1)), MONTHS[month.group(1).lower()])
+
+
+def find_zip_url(html: str, base: str = HPI_TOOL_URL) -> str:
+    """Pick the English MLS_HPI archive link out of the HPI tool page."""
+    urls = []
+    for href in HREF.findall(html):
+        url = urljoin(base, unescape(href).strip())
+        name = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+        if ZIP_NAME.search(name) and not FRENCH.search(name) and url not in urls:
+            urls.append(url)
+    if not urls:
+        raise DecodeError("no MLS_HPI zip link found on the CREA HPI tool page")
+    # Newest month wins if the page ever lists more than one; ties keep page order.
+    return max(urls, key=zip_month)
+
+
 def find_latest_zip_url() -> str:
     """Scrape the HPI tool page for the current month's archive URL."""
     import urllib.request
@@ -57,16 +97,13 @@ def find_latest_zip_url() -> str:
     req = urllib.request.Request(HPI_TOOL_URL, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=60) as resp:
         html = resp.read().decode("utf-8", "replace")
-    urls = re.findall(r'https://www\.crea\.ca/files/mls-hpi-data/MLS_HPI-[^"\']+_EN\.zip', html)
-    if not urls:
-        raise DecodeError("no MLS_HPI zip link found on the CREA HPI tool page")
-    return urls[0]
+    return find_zip_url(html)
 
 
 def download(url: str, dest=None):
     import urllib.request
 
-    dest = dest or RAW / url.rsplit("/", 1)[-1]
+    dest = dest or RAW / unquote(urlsplit(url).path.rsplit("/", 1)[-1])
     if dest.exists():
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -132,24 +169,35 @@ def parse_workbook(path, sheet_names, frequency: str, adjusted: bool):
                 }
 
 
+def extract_workbooks(zip_path, extract_dir):
+    """Unpack the four workbooks, replacing whatever an earlier month left.
+
+    data/raw is cached between CI runs, so a stale copy here would silently
+    re-parse last month's figures under this month's archive.
+    """
+    extracted = {}
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        for member in WORKBOOKS:
+            if member not in names:
+                print(f"  ! missing {member} in archive", file=sys.stderr)
+                continue
+            target = extract_dir / member
+            target.write_bytes(zf.read(member))
+            extracted[member] = target
+    return extracted
+
+
 def main() -> int:
     url = find_latest_zip_url()
     print(f"CREA archive: {url}")
     zip_path = download(url)
 
     records = []
-    with zipfile.ZipFile(zip_path) as zf:
-        names = set(zf.namelist())
-        extract_dir = RAW / "crea_hpi"
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        for member, (frequency, adjusted) in WORKBOOKS.items():
-            if member not in names:
-                print(f"  ! missing {member} in archive", file=sys.stderr)
-                continue
-            target = extract_dir / member
-            if not target.exists():
-                target.write_bytes(zf.read(member))
-            records.extend(parse_workbook(target, SHEETS, frequency, adjusted))
+    for member, target in extract_workbooks(zip_path, RAW / "crea_hpi").items():
+        frequency, adjusted = WORKBOOKS[member]
+        records.extend(parse_workbook(target, SHEETS, frequency, adjusted))
 
     if not records:
         raise DecodeError("parsed zero CREA records")
