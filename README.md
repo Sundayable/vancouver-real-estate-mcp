@@ -80,6 +80,7 @@ The MCP tools surface this: `*` marks chain-linked, `+` marks estimated.
 ```bash
 PY="$HOME/Desktop/Claude Code/.venv/bin/python"
 cd ingest
+$PY -m unittest discover -s tests  # scraper unit tests, no network
 $PY fvreb_hpi_db.py      # legacy 1991-2011 (needs data/raw/HPIMLX_DB.xlsx)
 $PY crea_hpi.py          # finds and downloads the current CREA archive
 $PY discover_gvr.py      # probes GVR PDF URLs -> data/out/gvr_pdf_index.json
